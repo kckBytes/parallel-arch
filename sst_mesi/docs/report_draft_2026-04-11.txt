@@ -1,0 +1,106 @@
+report.txt — Project 2 Part 2
+Unity ID: ckunda
+
+────────────────────────────────────────────────────────────────
+1. Optimization selected: Migratory Sharing
+────────────────────────────────────────────────────────────────
+
+Migratory sharing is a common sharing pattern where a cache line is
+repeatedly read and then written by one core before passing to the
+next core. In base MESI, a read miss fetches the line in S (shared)
+state; when the core later writes, it must issue a GetX upgrade
+request, which generates an Inv broadcast and a GetXResp round-trip.
+That upgrade is wasted bus bandwidth, because the core was going to
+write anyway.
+
+The optimization detects this pattern at the L1 level: when a GetS
+(read) miss is received and coherence_opt is enabled, the L1 promotes
+the miss to a GetX request. The line arrives directly in M (Modified)
+state via the normal IM→M path in handleGetXResp. When the subsequent
+write arrives from the CPU, the L1 sees state M — a cache hit — and
+no bus transaction is needed at all.
+
+The trade-off: if the core reads but never writes, the line was fetched
+exclusively when it did not need to be. This causes unnecessary
+invalidations in other caches that might also want to read it. The
+optimization is therefore most beneficial for workloads with strong
+migratory patterns (read-then-write by one owner at a time) and less
+beneficial for read-sharing workloads.
+
+────────────────────────────────────────────────────────────────
+2. Changes made to implement the optimization
+────────────────────────────────────────────────────────────────
+
+Files modified:
+  - coherencemgr/MESI_L1.cc   (two changes, described below)
+  - coherencemgr/MESI_L1.h    (replaced with provided proj2p2 version;
+                                declares coherence_opt_ member)
+  - cacheFactory.cc            (replaced with provided proj2p2 version;
+                                passes coherence_opt parameter to MESIL1)
+
+Change A — Constructor MESIL1::MESIL1():
+  Added the line:
+      coherence_opt_ = params.find<bool>("coherence_opt", false);
+  This reads the coherence_opt parameter from the SST configuration and
+  stores it in the member variable so all handlers can query it.
+
+Change B — handleGetS(), state-I (miss) branch:
+  The original code:
+      forwardMessage(event, lineAddr, Command::GetS, nullptr, 0);
+      line->setState(IS);
+  Was replaced with:
+      if (coherence_opt_) {
+          forwardMessage(event, lineAddr, Command::GetX, nullptr, 0);
+          line->setState(IM);
+      } else {
+          forwardMessage(event, lineAddr, Command::GetS, nullptr, 0);
+          line->setState(IS);
+      }
+
+  When the optimization is on, the L1 sends GetX downward instead of
+  GetS. The L2 (MESI_Inclusive) responds with a GetXResp, which is
+  handled by the existing handleGetXResp() path: IM → M. No new state
+  machine transitions were added; the optimization reuses the existing
+  write-miss path.
+
+────────────────────────────────────────────────────────────────
+3. Directed test case and observed improvement
+────────────────────────────────────────────────────────────────
+
+Test case description:
+  4 cores access a single cache line at address 0x1000 (4096) in a
+  sequential round-robin pattern. Each core first reads (R) the line
+  and then writes (W) it before the next core takes ownership.
+  Cores are offset in time so their accesses do not overlap:
+    Core 0: accesses at cycles 0, 100, 400, 500, ...
+    Core 1: accesses at cycles 2000, 2100, 4000, 4100, ...
+    Core 2: accesses at cycles 4200, 4300, 8200, 8300, ...
+    Core 3: accesses at cycles 6400, 6500, 12400, 12500, ...
+
+  Each core performs 4 read→write pairs, for 32 total CPU requests.
+
+Expected behavior — Base mode (coherence_opt=0):
+  For each read→write pair on a given core:
+    1. Read miss (state I):  L1 sends GetS → L2 responds GetSResp
+                              line state: I → IS → S
+    2. Write (state S):      L1 sends GetX → L2 broadcasts Inv to
+                              other sharers → GetXResp
+                              line state: S → SM → M
+  = 2 bus transactions per read→write pair per core.
+
+Expected behavior — Optimized mode (coherence_opt=1):
+  For each read→write pair on a given core:
+    1. Read miss (state I):  L1 sends GetX → L2 responds GetXResp
+                              line state: I → IM → M
+    2. Write (state M):      L1 hit — no bus traffic at all.
+  = 1 bus transaction per read→write pair per core.
+
+Observed improvement:
+  The eventSent_GetX counter increases in opt mode (all reads become
+  GetX), while eventSent_GetS drops to 0. The stateEvent_GetX_S
+  counter (upgrade from S) drops to 0 in opt mode — confirming that
+  no upgrade round-trips occur. The total number of bus transactions
+  for the migratory pattern is reduced by approximately 50%.
+  Simulation cycles to completion also decrease because the upgrade
+  latency (Inv broadcast + acknowledgement + GetXResp) is eliminated
+  for every read→write sequence.

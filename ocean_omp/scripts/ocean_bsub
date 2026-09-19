@@ -1,0 +1,25 @@
+#!/bin/bash 
+#BSUB -n 32
+#BSUB -W 20 
+#BSUB -R "rusage[mem=2]"
+#BSUB -R "select[model==Gold6130]"
+#BSUB -R "span[hosts=1]"
+#BSUB -o out.%J
+#BSUB -J proj1
+OCEAN=./ocean_omp  # name of executable
+
+whoami
+lscpu
+
+for T in {1,2,4,8,16}
+do
+   export OMP_NUM_THREADS=$T
+   echo "******************************"
+   echo "---- $T threads ----"
+   echo "******************************"
+   for i in {1..10}
+   do
+      $OCEAN 1026 5000 grid1026_hotTop.txt /dev/null 
+   done
+done
+

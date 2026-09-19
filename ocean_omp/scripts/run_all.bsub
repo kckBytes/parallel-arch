@@ -1,0 +1,52 @@
+#!/bin/bash
+#BSUB -n 16
+#BSUB -W 60
+#BSUB -R "rusage[mem=4]"
+#BSUB -R "select[model==Gold6130]"
+#BSUB -R "span[hosts=1]"
+#BSUB -x
+#BSUB -o out.%J
+#BSUB -J proj1_3
+
+# Executables
+STATIC=./ocean_static
+STATIC32=./ocean_static32
+DYNAMIC=./ocean_dynamic
+SQUARE=./ocean_square
+
+GRID=./grid1026_hotTop.txt
+SIZE=1026
+STEPS=5000
+
+whoami
+lscpu
+
+for T in 1 2 4 8 16
+do
+    export OMP_NUM_THREADS=$T
+    echo "=============================="
+    echo "THREADS = $T"
+    echo "=============================="
+
+    echo "--- static (chunks = nthreads) ---"
+    for i in $(seq 1 10); do
+        $STATIC $SIZE $STEPS $GRID /dev/null
+    done
+
+    if [ $T -gt 1 ]; then
+        echo "--- static chunk=32 ---"
+        for i in $(seq 1 10); do
+            $STATIC32 $SIZE $STEPS $GRID /dev/null
+        done
+
+        echo "--- dynamic ---"
+        for i in $(seq 1 10); do
+            $DYNAMIC $SIZE $STEPS $GRID /dev/null
+        done
+
+        echo "--- square chunks ---"
+        for i in $(seq 1 10); do
+            $SQUARE $SIZE $STEPS $GRID /dev/null
+        done
+    fi
+done
