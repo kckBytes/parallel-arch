@@ -1,0 +1,98 @@
+report.txt — Project 2 Part 2
+Unity ID: ckunda
+
+────────────────────────────────────────────────────────────────
+1. Optimization selected: Migratory Sharing
+────────────────────────────────────────────────────────────────
+
+Migratory sharing is a common sharing pattern where a cache line is
+repeatedly read and then written by one core before passing to the
+next core. In base MESI, a read miss fetches the line in S (shared)
+state; when the core later writes, it must issue a GetX upgrade
+request, which generates an Inv broadcast and a GetXResp round-trip.
+That upgrade is wasted bus bandwidth, because the core was going to
+write anyway.
+
+The optimization detects this pattern at the L1 level: when a GetS
+(read) miss is received and coherence_opt is enabled, the L1 promotes
+the miss to a GetX request. The line arrives directly in M (Modified)
+state via the normal IM→M path in handleGetXResp. When the subsequent
+write arrives from the CPU, the L1 sees state M — a cache hit — and
+no bus transaction is needed at all.
+
+The trade-off: if the core reads but never writes, the line was fetched
+exclusively when it did not need to be. This causes unnecessary
+invalidations in other caches that might also want to read it. The
+optimization is therefore most beneficial for workloads with strong
+migratory patterns (read-then-write by one owner at a time) and less
+beneficial for read-sharing workloads.
+
+────────────────────────────────────────────────────────────────
+2. Changes made to implement the optimization
+────────────────────────────────────────────────────────────────
+
+Files modified:
+  - coherencemgr/MESI_L1.cc   (two changes, described below)
+  - coherencemgr/MESI_L1.h    (replaced with provided proj2p2 version;
+                                declares coherence_opt_ member)
+  - cacheFactory.cc            (replaced with provided proj2p2 version;
+                                passes coherence_opt parameter to MESIL1)
+
+Change A — Constructor MESIL1::MESIL1():
+  Added the line:
+      coherence_opt_ = params.find<bool>("coherence_opt", false);
+  This reads the coherence_opt parameter from the SST configuration and
+  stores it in the member variable so all handlers can query it.
+
+Change B — handleGetS(), state-I (miss) branch:
+  The original code:
+      forwardMessage(event, lineAddr, Command::GetS, nullptr, 0);
+      line->setState(IS);
+  Was replaced with:
+      if (coherence_opt_) {
+          forwardMessage(event, lineAddr, Command::GetX, nullptr, 0);
+          line->setState(IM);
+      } else {
+          forwardMessage(event, lineAddr, Command::GetS, nullptr, 0);
+          line->setState(IS);
+      }
+
+  When the optimization is on, the L1 sends GetX downward instead of
+  GetS. The L2 (MESI_Inclusive) responds with a GetXResp, which is
+  handled by the existing handleGetXResp() path: IM → M. No new state
+  machine transitions were added; the optimization reuses the existing
+  write-miss path.
+
+────────────────────────────────────────────────────────────────
+3. Directed test case and observed improvement
+────────────────────────────────────────────────────────────────
+
+Test case description:
+  4 cores access a single cache line at address 0x1000 (4096) in a
+  sequential round-robin pattern. Each core first reads the line and
+  then writes it before the next core takes ownership:
+    Core 0: cycle 0 (R), cycle 100 (W)
+    Core 1: cycle 2000 (R), cycle 2100 (W)
+    Core 2: cycle 4000 (R), cycle 4100 (W)
+    Core 3: cycle 6000 (R), cycle 6100 (W)
+
+Observed results - Base mode (coherence_opt=0):
+  l1cache0: inv=1 getS_sent=1 getX_sent=1 S->I=0 M->I=1
+  l1cache1: inv=3 getS_sent=1 getX_sent=1 S->I=2 M->S=1
+  l1cache2: inv=2 getS_sent=1 getX_sent=1 S->I=1 M->S=1
+  l1cache3: inv=0 getS_sent=1 getX_sent=1 S->I=0
+  Each core issues both a GetS (read miss) and a GetX (upgrade) -
+  two bus transactions per read->write pair.
+
+Observed results - Optimized mode (coherence_opt=1):
+  l1cache0: inv=0 getS_sent=0 getX_sent=1 S->I=0
+  l1cache1: inv=0 getS_sent=0 getX_sent=1 S->I=0
+  l1cache2: inv=0 getS_sent=0 getX_sent=1 S->I=0
+  l1cache3: inv=0 getS_sent=0 getX_sent=1 S->I=0
+  GetS eliminated entirely. Every read miss goes directly to GetX,
+  line arrives in M, subsequent write is a hit with no bus traffic.
+
+Improvement summary:
+  - GetS requests: 4 total -> 0 (100% reduction)
+  - Upgrade invalidations: 6 total -> 0 (100% reduction)
+  - Bus transactions per read->write pair: 2 -> 1 (50% reduction)

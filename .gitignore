@@ -1,0 +1,6 @@
+# parallel_arch -- keep sources, scripts, raw .out results, STATE. Exclude rebuildable output.
+ocean_omp/_build/ocean_*
+ocean_omp/_build/raw_*.txt
+ocean_omp/data/grid1026_hotTop.txt
+__pycache__/
+# keep: ocean_omp/_build/summary.csv, times_*.csv, sweep_stdout.txt (the measurements)
